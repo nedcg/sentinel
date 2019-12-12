@@ -6,19 +6,19 @@
             [verdun-app.service :as service]
             [verdun-app.template :as template]))
 
-(defn html-response
+(defn- html-response
   [html]
   (-> html
       ring-resp/response
       (ring-resp/content-type "text/html")))
 
-(defn json-response
+(defn- json-response
   [json]
   (-> json
       ring-resp/response
       (ring-resp/content-type "application/json")))
 
-(defn edn-response
+(defn- edn-response
   [edn]
   (-> edn
       ring-resp/response

@@ -8,11 +8,16 @@
             [monger.util :as monger-util]
             [monger.operators :refer :all]
             [clj-time.core :as t]
+            [taoensso.carmine :as car :refer (wcar)]
+            [taoensso.carmine.message-queue :as car-mq]
             [clojure.data.json :as json]
             [clojure.java.io :as io]))
 
 (defn- now [] (new java.util.Date))
 (def default-pagination {:lk nil :limit 20})
+
+(def server1-conn {:pool {} :spec {:uri "redis://localhost:6379/"}})
+(defmacro wcar* [& body] `(car/wcar server1-conn ~@body))
 
 (def privkey
   (ks/private-key
@@ -49,7 +54,36 @@
     (store/insert db :users user)))
 
 (defn create-task [db task]
-  (store/insert db :tasks task))
+  (let [default-values {:status :initial}]
+    (store/insert db :tasks (merge task default-values))))
+
+(def workers
+  (car-mq/worker
+   db (name :task-assigned)
+   {:handler
+    (fn [{:keys [message attempt]
+          {:keys [user-id task-id]} message}]
+      {:status :success})}))
+
+(defn mq-enqueue [db queue msg]
+  (wcar* (car-mq/enqueue (name queue) msg)))
+
+(defn assign-task
+  "Assign a task to a user. If the task currently belongs to another user,
+  then it must be prioritized for the previous and new user, elsewhere
+  the priority for the task will be minimum"
+  [db task-id user-id]
+  (let [user (store/get-by-id db :users user-id)
+        task (store/get-by-id db :tasks task-id)]
+    (store/update-one
+     :tasks
+     {:_id task-id
+      :assigned-to (:assigned-to user)}
+     {:assigned-to user-id
+      :updated-at (now)})))
+
+(defn prioritize-task [db task-id priority]
+  )
 
 (defn find-tasks [db pagination]
   (store/find-by db :tasks {} (merge default-pagination pagination)))
