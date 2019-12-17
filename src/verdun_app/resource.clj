@@ -6,18 +6,53 @@
             [io.pedestal.http.ring-middlewares :as middlewares]
             [io.pedestal.interceptor.error :as error-int]
             [io.pedestal.log :as log]
+            [io.pedestal.http.content-negotiation :as conneg]
             [ring.util.response :as ring-resp]
             [verdun-app.handler :as handler]
             [verdun-app.service :as service]
-            [monger.core :as monger]
+            [next.jdbc.connection :as connection]
+            [cheshire.core :as json]
             [ring.middleware.session.cookie :refer [cookie-store]])
-  (:import org.bson.types.ObjectId))
+  (:import org.bson.types.ObjectId
+           (com.zaxxer.hikari HikariDataSource)))
+
+(def db-spec
+  {:jdbcUrl (or (System/getenv "VERDUN_DB_URI") "jdbc:mysql://root:root@127.0.0.1:3306/verdun")})
+
+(defonce ^HikariDataSource ds
+  (connection/->pool HikariDataSource db-spec))
+
+(def content-neg-interceptor
+  (conneg/negotiate-content ["application/edn" "application/json" "text/html"]))
+
+(def coerce-body
+  {:name ::coerce-body
+   :leave
+   (fn [context]
+     (let [accepted         (get-in context [:request :accept :field] "text/plain")
+           response         (get context :response)
+           body             (get response :body)
+           coerced-body     (case accepted
+                              "text/html"        body
+                              "text/plain"       body
+                              "application/edn"  (pr-str body)
+                              "application/json" (json/generate-string body))
+           updated-response (assoc response
+                                   :headers {"Content-Type" accepted}
+                                   :body    coerced-body)]
+       (assoc context :response updated-response)))})
 
 (def db-interceptor
-  {:name ::db-interceptor
-   :enter #(let [conn (monger/connect)
-                 db   (monger/get-db conn "verdun")]
-             (update % :request assoc :conn conn :db db))})
+  {:name  ::db-interceptor
+   :enter #(let [db ds]
+             (update % :request assoc :db db))})
+
+(def header-auth-token-interceptor
+  {:name ::wrap-auth-token-interceptor
+   :enter (fn [ctx]
+            (if-let [auth-token (get-in ctx [:request :headers "authentication"])]
+              (update-in ctx [:request :session] assoc :token auth-token)
+              ctx))})
 
 (def wrap-auth-token-interceptor
   {:name ::wrap-auth-token-interceptor
@@ -43,30 +78,40 @@
             (log/debug :response (:response ctx))
             ctx)})
 
+(defn- chain-error [ctx ex]
+  (assoc ctx :io.pedestal.interceptor.chain/error ex))
+
 (def error-handler-interceptor
-  (error-int/error-dispatch [ctx ex]
-                            [{:exception-type :java.lang.ArithmeticException}]
-                            (assoc ctx :response {:status 400 :body "Another bad one"})
-                            :else (assoc ctx :io.pedestal.interceptor.chain/error ex)))
+  (error-int/error-dispatch
+   [ctx ex]
+   [{:interceptor :verdun-app.resource/wrap-auth-token-interceptor}] ;; not working
+   (assoc ctx :response {:status 401 :body {:code :e_invalid_token}})
+   [{:exception-type :clojure.lang.ExceptionInfo}]
+   (clojure.core.match/match
+    [(ex-data ex)]
+    [{:code :e_duplicated_key}] (assoc ctx :response {:status 400 :body {:code :e_duplicated_key}})
+    [{:code :w_user_not_found}] (assoc ctx :response {:status 400 :body {:code :e_invalid_credentials}})
+    [{:code :w_password_incorrect}] (assoc ctx :response {:status 400 :body {:code :e_invalid_credentials}})
+    :else (chain-error ctx ex))
+   :else (chain-error ctx ex)))
 
 (def common-interceptors
-  [(body-params/body-params)
+  [coerce-body
+   content-neg-interceptor
+   (body-params/body-params)
    params/keyword-params
-   http/html-body
    (middlewares/session {:store (cookie-store)
                          :cookie-name "verdun"
                          :cookie-attrs {:max-age (* 60 60 24)}})
-   (middlewares/flash)
    db-interceptor
+   header-auth-token-interceptor
    wrap-auth-token-interceptor
-   spy-interceptor])
+   error-handler-interceptor])
 
 (def routes
-  #{["/signup"  :get   (conj common-interceptors `handler/handle-signup-get)]
-    ["/signup"  :post  (conj common-interceptors `handler/handle-signup-post)]
-    ["/login"   :get   (conj common-interceptors `handler/handle-login-get)]
+  #{["/signup"  :post  (conj common-interceptors `handler/handle-signup-post)]
     ["/login"   :post  (conj common-interceptors `handler/handle-login-post)]
-    ["/tasks"   :get   (conj common-interceptors auth-interceptor spy-interceptor `handler/handle-tasks-get)]
+    ["/tasks"   :get   (conj common-interceptors auth-interceptor `handler/handle-tasks-get)]
     ["/tasks"   :post  (conj common-interceptors auth-interceptor `handler/handle-tasks-post)]})
 
 (def resource

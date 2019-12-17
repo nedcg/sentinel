@@ -1,7 +1,6 @@
 (ns verdun-app.server
   (:gen-class) ; for -main method in uberjar
   (:require [io.pedestal.http :as server]
-            [monger.core :as monger]
             [verdun-app.store :as store]
             [io.pedestal.http.route :as route]
             [verdun-app.resource :as resource]))
@@ -11,8 +10,6 @@
 (defn run-dev
   "The entry-point for 'lein run-dev'"
   [& args]
-  (println "\nSetting up database ...")
-  (store/setup-db (monger/get-db (monger/connect) "verdun"))
   (println "\nCreating your [DEV] server...")
   (-> resource/resource ;; start with production configuration
       (merge {:env :dev
