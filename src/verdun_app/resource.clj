@@ -50,6 +50,7 @@
 (def header-auth-token-interceptor
   {:name ::wrap-auth-token-interceptor
    :enter (fn [ctx]
+            (log/spy (get-in ctx [:request :headers]))
             (if-let [auth-token (get-in ctx [:request :headers "authentication"])]
               (update-in ctx [:request :session] assoc :token auth-token)
               ctx))})
@@ -84,7 +85,7 @@
 (def error-handler-interceptor
   (error-int/error-dispatch
    [ctx ex]
-   [{:interceptor :verdun-app.resource/wrap-auth-token-interceptor}] ;; not working
+   [{:interceptor :verdun-app.resource/header-auth-token-interceptor}] ;; not working
    (assoc ctx :response {:status 401 :body {:code :e_invalid_token}})
    [{:exception-type :clojure.lang.ExceptionInfo}]
    (clojure.core.match/match
@@ -96,23 +97,24 @@
    :else (chain-error ctx ex)))
 
 (def common-interceptors
-  [coerce-body
+  [(middlewares/session {:store (cookie-store)
+                         :cookie-name "verdun"
+                         :cookie-attrs {:max-age (* 60 60 24)}})
+   coerce-body
    content-neg-interceptor
    (body-params/body-params)
    params/keyword-params
-   (middlewares/session {:store (cookie-store)
-                         :cookie-name "verdun"
-                         :cookie-attrs {:max-age (* 60 60 24)}})
    db-interceptor
    header-auth-token-interceptor
    wrap-auth-token-interceptor
    error-handler-interceptor])
 
 (def routes
-  #{["/signup"  :post  (conj common-interceptors `handler/handle-signup-post)]
-    ["/login"   :post  (conj common-interceptors `handler/handle-login-post)]
-    ["/tasks"   :get   (conj common-interceptors auth-interceptor `handler/handle-tasks-get)]
-    ["/tasks"   :post  (conj common-interceptors auth-interceptor `handler/handle-tasks-post)]})
+  #{["/signup"                :post  (conj common-interceptors `handler/handle-signup-post)]
+    ["/login"                 :post  (conj common-interceptors `handler/handle-login-post)]
+    ["/tasks"                 :get   (conj common-interceptors auth-interceptor `handler/handle-tasks-get)]
+    ["/tasks"                 :post  (conj common-interceptors auth-interceptor `handler/handle-task-post)]
+    ["/tasks/:task_id/assign" :put   (conj common-interceptors auth-interceptor `handler/handle-task-assign-put)]})
 
 (def resource
   {:env :prod

@@ -2,18 +2,13 @@
   (:require [next.jdbc :as jdbc]
             [next.jdbc.sql :as sql]
             [ragtime.jdbc :as rjdbc]
-            [ragtime.repl :as repl])
-  (:import org.bson.types.ObjectId))
+            [ragtime.repl :as repl]))
 
 (def db-spec
   {:jdbcUrl (or (System/getenv "VERDUN_DB_URI") "jdbc:mysql://root:root@127.0.0.1:3306/verdun")})
 
 (defn- now [] (new java.util.Date))
-(defn- oid [] (str (ObjectId.)))
 (def default-limit 20)
-
-(defn- default-new-record []
-  {:id (oid)})
 
 (defn load-config []
   {:datastore  (rjdbc/sql-database (:jdbcUrl db-spec))
@@ -30,14 +25,14 @@
 
 (defn find-by [db table query]
   (let [limit (:limit query)
-        query (dissoc query :limit)]
+        order-by (:order-by query)
+        query (dissoc query :limit :order-by)
+        opts {:builder-fn next.jdbc.result-set/as-unqualified-maps
+              :max-rows (or limit default-limit)}
+        opts (when order-by (merge opts {:order-by order-by}) opts)]
     (if (empty? query)
-      (sql/query db [(str "select * from " (name table))]
-                 {:builder-fn next.jdbc.result-set/as-unqualified-maps
-                  :max-rows (or limit default-limit)})
-      (sql/find-by-keys db table query
-                        {:builder-fn next.jdbc.result-set/as-unqualified-maps
-                         :max-rows (or limit default-limit)}))))
+      (sql/query db [(str "select * from " (name table))] opts)
+      (sql/find-by-keys db table query opts))))
 
 (defn find-one [db table query]
   (let [res (find-by db table query)]
@@ -48,13 +43,16 @@
       (first res))))
 
 (defn insert! [db table record]
-  (let [record (merge (default-new-record) record)]
-    (try
-      (sql/insert! db table record)
-      (catch java.sql.SQLIntegrityConstraintViolationException e
-        (throw (ex-info "duplicate key" {:code :e_duplicated_key :exception e}))))))
+  (try
+    (sql/insert! db table record)
+    (:id record)
+    (catch java.sql.SQLIntegrityConstraintViolationException e
+      (throw (ex-info "duplicate key" {:code :e_duplicated_key :exception e})))))
 
 (defn update! [db table query set-map]
   (sql/update! db table set-map query))
+
+(defn delete! [db table query]
+  (sql/delete! db table query))
 
 ;; (insert! db-spec :user {:username "nedcg1" :email "nedcg1@outlook.com" :password "nedcg123"})

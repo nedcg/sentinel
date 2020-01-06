@@ -10,11 +10,15 @@
             [taoensso.carmine.message-queue :as car-mq]
             [next.jdbc :as jdbc]
             [clojure.data.json :as json]
-            [clojure.java.io :as io]))
+            [clojure.java.io :as io])
+  (:import org.bson.types.ObjectId))
 
 (defn- now [] (new java.util.Date))
 (def server1-conn {:pool {} :spec {:uri "redis://localhost:6379/"}})
 (defmacro wcar* [& body] `(car/wcar server1-conn ~@body))
+(defn- oid [] (str (ObjectId.)))
+(defn- default-new-record []
+  {:id (oid)})
 
 (def privkey
   (ks/private-key
@@ -49,12 +53,12 @@
   (let [user (-> user
                  (update :password hashers/derive)
                  (assoc :email_verification_token (uuid)))]
-    (store/insert! db :user user)))
+    (store/insert! db :user (merge (default-new-record) user))))
 
 (defn mq-enqueue [db queue msg]
   (wcar* (car-mq/enqueue (name queue) msg)))
 
-(defn- bump-tasks-priorities [db assigned-to from-priority]
+(defn- increase-tasks-priorities [db assigned-to from-priority]
   (store/execute! db [(str "UPDATE priority "
                            "SET priority_user=priority_user + 1 "
                            "WHERE user_id=? AND priority_user GE ? ")
@@ -69,7 +73,13 @@
 (defn decreate-user-assigned-task-count [db user-id]
   (store/execute! db [(str "UPDATE user "
                            "SET task_assigned_count=task_assigned_count-1 "
-                           "WHERE user_id=?")
+                           "WHERE id=?")
+                      user-id]))
+
+(defn increate-user-assigned-task-count [db user-id]
+  (store/execute! db [(str "UPDATE user "
+                           "SET task_assigned_count=task_assigned_count+1 "
+                           "WHERE id=?")
                       user-id]))
 
 (defn unassign-task [db user-id task-id]
@@ -78,34 +88,79 @@
                             :priority_user))]
     (decreate-user-assigned-task-count db user-id)
     (decrease-tasks-priorities db user-id priority))
-  (store/update! db :task {:id task-id} {:assigned_to nil})
-  (store/insert! db :task_history {:type :update :task_id task-id :fields {:assigned_to nil}}))
+  (let [set-map {:assigned_to nil}]
+    (store/update! db :task {:id task-id} set-map)
+    (store/insert! db :task_history (merge (default-new-record)
+                                           {:type (name :update)
+                                            :task_id task-id
+                                            :fields {:assigned_to nil}}))))
+
+(defn- priorities-fetch [db user-id]
+  (let [nodes (store/execute! db ["SELECT task_id, next_task_id, prev_task_id FROM priority WHERE user_id=?" user-id])]
+    (reduce
+     (fn [res node]
+       [(if (some? (:prev_task_id node)) (first res) node)
+        (assoc (last res) (:task_id node) node)])
+     [nil {}]
+     nodes)))
+
+(defn- priorities-get [db user-id]
+  (let [[root nodes] (priorities-fetch db user-id)]
+    (loop [next (:task_id root)
+           res  []]
+      (if-not (some? (get nodes next))
+        res
+        (recur (:next_task_id (get nodes next))
+               (conj res (get nodes next)))))))
+
+(defn- priorities-insert [db user-id task-id]
+  (let [[{last-task-id :task_id}] (store/execute! db ["SELECT task_id FROM priority WHERE user_id=? AND next_task_id IS NULL" user-id])]
+    (if (some? last-task-id)
+      (do
+        (store/insert! db :priority {:user_id user-id :task_id task-id :prev_task_id last-task-id})
+        (store/update! db :priority {:user_id user-id :task_id last-task-id} {:next_task_id task-id}))
+      (store/insert! db :priority {:user_id user-id :task_id task-id}))))
+
+(defn- priorities-remove [db user-id task-id]
+  (when-let [priority-record (store/find-by db :priority {:user_id user-id :task_id task-id})]
+    (let [{next-task-id :next_task_id
+           prev-task-id :prev_task_id} priority-record]
+      (if (some? next-task-id)
+        (store/update! db :priority {:user_id user-id :task_id next-task-id} {:prev_task_id prev-task-id}))
+      (if (some? prev-task-id)
+        (store/update! db :priority {:user_id user-id :task_id prev-task-id} {:next_task_id next-task-id}))
+      (store/delete! db :priority {:user_id user-id :task_id task-id}))))
+
+(defn prioritize-task [db user-id tasks-id]
+  )
 
 (defn assign-task
-  [db task-id user-id user-priority]
-  (let [task (store/find-one db :task {:id task-id})]
-    (when-let [prev-user-id (:assigned_to task)]
-      (unassign-task db prev-user-id task-id))
-    (store/update! db :task {:id task-id} {:assigned_to user-id})
-    (store/insert! db :task_history {:type :update :task_id task-id :fields {:assigned_to user-id}})))
+  [db task-id user-id assigned-by]
+  (let [{prev-assigned-to :assigned_to} (store/find-one db :task {:id task-id})
+        set-map                         {:updated_by  assigned-by
+                                         :assigned_to user-id}]
+    (when prev-assigned-to (unassign-task db prev-assigned-to task-id))
+    (increate-user-assigned-task-count db user-id)
+    (store/update! db :task {:id task-id} set-map)
+    (store/insert! db :task_history (merge (default-new-record)
+                                           {:type       (name :update)
+                                            :task_id    task-id
+                                            :created_by assigned-by
+                                            :fields     (json/write-str set-map)}))))
 
 (defn create-task [db task]
-  (let [task (store/insert! db :task task)]
-    (when-let [user-id (:assigned_to task)]
-      (assign-task db (:id task) user-id))
+  (let [assigned-to (:assigned_to task)
+        task-id (store/insert! db :task (merge (default-new-record) task))]
+    (when (some? assigned-to)
+      (assign-task db task-id assigned-to assigned-to)
+      (priorities-insert db assigned-to task-id))
     task))
-
-(defn prioritize-task [db task-id priority]
-  (let [task               (store/find-by db :task {:id task-id})
-        lower-priority     (-> (store/find-by db :priority {:task_id task-id :order-by [[:priority_user :desc]]})
-                               first :priority_user inc)
-        sanitized-priority (cond
-                             (< 1)              1
-                             (> lower-priority) lower-priority
-                             :else              priority)
-        assigned-to        (:assigned_to task)]
-    (bump-tasks-priorities db assigned-to priority)
-    (store/insert! db :priority {:task_id task-id :user_id assigned-to :priority_user priority})))
 
 (defn find-tasks [db {:keys [lk limit]}]
   (store/find-by db :task {}))
+
+(comment
+  (let [db {:jdbcUrl (or (System/getenv "VERDUN_DB_URI") "jdbc:mysql://root:root@127.0.0.1:3306/verdun")}
+        user-id (signup db {:name "Eduardo Caceres" :email "eduardo.caceres@outlook.com" :password "secret123" :username "nedcg"})]
+    (doseq [t (range 50)]
+      (create-task db {:title (str "title " t) :description (str "description " t) :created_by user-id :assigned_to user-id}))))
