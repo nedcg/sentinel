@@ -105,13 +105,14 @@
      nodes)))
 
 (defn- priorities-get [db user-id]
-  (let [[root nodes] (priorities-fetch db user-id)]
-    (loop [next (:task_id root)
-           res  []]
-      (if-not (some? (get nodes next))
-        res
-        (recur (:next_task_id (get nodes next))
-               (conj res (get nodes next)))))))
+  (let [[root nodes] (priorities-fetch db user-id)
+        sorted-nodes (loop [next (:task_id root)
+                            res  []]
+                       (if-not (some? (get nodes next))
+                         res
+                         (recur (:next_task_id (get nodes next))
+                                (conj res (get nodes next)))))]
+    (map #(store/find-one db :task {:id (:task_id %)}) sorted-nodes)))
 
 (defn- priorities-insert [db user-id task-id]
   (let [[{last-task-id :task_id}] (store/execute! db ["SELECT task_id FROM priority WHERE user_id=? AND next_task_id IS NULL" user-id])]
@@ -121,7 +122,20 @@
         (store/update! db :priority {:user_id user-id :task_id last-task-id} {:next_task_id task-id}))
       (store/insert! db :priority {:user_id user-id :task_id task-id}))))
 
-(defn- priorities-remove [db user-id task-id]
+(defn- priorities-move [db nodes user-id node-id node-before-id]
+  (let [a (get nodes node-id)
+        b (get nodes node-before-id)]
+    (when (not= (:task_id a) (:prev_task_id b))
+      (store/update! db :priority {:user_id user-id :task_id (:prev_task_id a)} {:next_task_id (:next_task_id a)})
+      (store/update! db :priority {:user_id user-id :task_id (:next_task_id a)} {:prev_task_id (:prev_task_id a)})
+
+      (store/update! db :priority {:user_id user-id :task_id (:task_id a)} {:next_task_id (:task_id b)})
+      (store/update! db :priority {:user_id user-id :task_id (:task_id a)} {:prev_task_id (:prev_task_id b)})
+
+      (store/update! db :priority {:user_id user-id :task_id (:prev_task_id b)} {:next_task_id (:task_id a)})
+      (store/update! db :priority {:user_id user-id :task_id (:task_id b)} {:prev_task_id (:task_id a)}))))
+
+(defn- priorities-delete [db user-id task-id]
   (when-let [priority-record (store/find-by db :priority {:user_id user-id :task_id task-id})]
     (let [{next-task-id :next_task_id
            prev-task-id :prev_task_id} priority-record]
@@ -130,9 +144,6 @@
       (if (some? prev-task-id)
         (store/update! db :priority {:user_id user-id :task_id prev-task-id} {:next_task_id next-task-id}))
       (store/delete! db :priority {:user_id user-id :task_id task-id}))))
-
-(defn prioritize-task [db user-id tasks-id]
-  )
 
 (defn assign-task
   [db task-id user-id assigned-by]
@@ -162,5 +173,5 @@
 (comment
   (let [db {:jdbcUrl (or (System/getenv "VERDUN_DB_URI") "jdbc:mysql://root:root@127.0.0.1:3306/verdun")}
         user-id (signup db {:name "Eduardo Caceres" :email "eduardo.caceres@outlook.com" :password "secret123" :username "nedcg"})]
-    (doseq [t (range 50)]
+    (doseq [t (range 5)]
       (create-task db {:title (str "title " t) :description (str "description " t) :created_by user-id :assigned_to user-id}))))
